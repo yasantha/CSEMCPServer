@@ -1,0 +1,20 @@
+{
+  "name": "cse-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Colombo Stock Exchange public API",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "cse",
+    "stocks"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  }
+}
