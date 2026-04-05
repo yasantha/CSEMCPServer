@@ -46,7 +46,7 @@ npm install
 2. Start MCP Inspector and attach this server:
 
 ```bash
-npx @modelcontextprotocol/inspector node /Users/amilakarunanayake/Documents/CSEMCPServer/CSEMCPServer/src/index.js
+npx @modelcontextprotocol/inspector node src/index.js
 ```
 
 3. In Inspector, open the `Tools` tab and click `List Tools`.
