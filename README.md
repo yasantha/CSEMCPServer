@@ -14,6 +14,8 @@ MCP server for Colombo Stock Exchange public API endpoints documented in `res/AP
 - `get_chart_data`
 - `get_detailed_trades`
 - `get_company_profile`
+- `tradingView`
+- `financials`
 - `get_financial_reports`
 - `get_noncompliance_list`
 

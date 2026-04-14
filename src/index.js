@@ -3,8 +3,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const BASE_URL = process.env.CSE_API_BASE_URL || "https://www.cse.lk/api";
+const WEB_BASE_URL = process.env.CSE_WEB_BASE_URL || "https://www.cse.lk";
 const CACHE_TTL_MS = 30_000;
 const REQUEST_TIMEOUT_MS = Number(process.env.CSE_REQUEST_TIMEOUT_MS || 15_000);
+const FINANCIALS_PREFLIGHT_CACHE_MS = Number(
+  process.env.CSE_FINANCIALS_PREFLIGHT_CACHE_MS || 60_000
+);
 
 const DEFAULT_HEADERS = {
   "User-Agent":
@@ -17,6 +21,7 @@ const DEFAULT_HEADERS = {
 };
 
 const cache = new Map();
+const financialsSessionCache = new Map();
 
 const cachedEndpoints = new Set([
   "tradeSummary",
@@ -129,6 +134,188 @@ async function csePost(endpoint, bodyObj = {}) {
   }
 
   return normalized;
+}
+
+async function csePostJson(endpoint, bodyObj = {}, extraHeaders = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`${BASE_URL}/${endpoint}`, {
+      method: "POST",
+      headers: {
+        ...DEFAULT_HEADERS,
+        "Content-Type": "application/json",
+        ...extraHeaders
+      },
+      body: JSON.stringify(bodyObj),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(
+        `CSE API timeout for ${endpoint} after ${REQUEST_TIMEOUT_MS}ms`
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const raw = await response.text();
+  let parsed;
+  try {
+    parsed = raw ? JSON.parse(raw) : {};
+  } catch {
+    const contentType = response.headers.get("content-type") || "unknown";
+    throw new Error(
+      `CSE API returned non-JSON payload for ${endpoint} (content-type: ${contentType}): ${raw.slice(0, 300)}`
+    );
+  }
+
+  if (!response.ok) {
+    const serialized = JSON.stringify(parsed).slice(0, 500);
+    throw new Error(
+      `CSE API error for ${endpoint}: HTTP ${response.status}${serialized ? ` - ${serialized}` : ""}`
+    );
+  }
+
+  return normalizeNumbers(parsed);
+}
+
+function extractCookieHeader(response) {
+  if (typeof response.headers.getSetCookie === "function") {
+    const cookies = response.headers
+      .getSetCookie()
+      .map((cookie) => String(cookie).split(";")[0]?.trim())
+      .filter(Boolean);
+    return cookies.join("; ");
+  }
+
+  const single = response.headers.get("set-cookie");
+  if (!single) return "";
+  return String(single).split(";")[0]?.trim() || "";
+}
+
+async function getFinancialsSessionCookie(symbol) {
+  const normalizedSymbol = symbol.toUpperCase();
+  const cached = financialsSessionCache.get(normalizedSymbol);
+  const now = Date.now();
+  if (cached && now - cached.timestamp < FINANCIALS_PREFLIGHT_CACHE_MS) {
+    return cached.cookie;
+  }
+
+  const url = `${WEB_BASE_URL}/company-profile?symbol=${encodeURIComponent(symbol)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Referer: `${WEB_BASE_URL}/`
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `CSE preflight failed for symbol ${symbol}: HTTP ${response.status}`
+      );
+    }
+
+    const cookie = extractCookieHeader(response);
+    financialsSessionCache.set(normalizedSymbol, {
+      timestamp: now,
+      cookie
+    });
+    return cookie;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(
+        `CSE preflight timeout for symbol ${symbol} after ${REQUEST_TIMEOUT_MS}ms`
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function csePostFinancials(symbol) {
+  const cookie = await getFinancialsSessionCookie(symbol);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${BASE_URL}/financials`, {
+      method: "POST",
+      headers: {
+        ...DEFAULT_HEADERS,
+        Referer: `${WEB_BASE_URL}/company-profile?symbol=${encodeURIComponent(symbol)}`,
+        ...(cookie ? { Cookie: cookie } : {})
+      },
+      body: new URLSearchParams({ symbol }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(
+        `CSE API error for financials: HTTP ${response.status}${body ? ` - ${body.slice(0, 300)}` : ""}`
+      );
+    }
+
+    const raw = await response.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      const contentType = response.headers.get("content-type") || "unknown";
+      throw new Error(
+        `CSE API returned non-JSON payload for financials (content-type: ${contentType}): ${raw.slice(0, 300)}`
+      );
+    }
+    return normalizeNumbers(parsed);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`CSE API timeout for financials after ${REQUEST_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function withCdnUrl(pathValue) {
+  if (!pathValue) return null;
+  return `https://cdn.cse.lk/${String(pathValue).replace(/^\/+/, "")}`;
+}
+
+function enrichFinancialsPayload(payload) {
+  const mapRows = (rows) =>
+    Array.isArray(rows)
+      ? rows.map((row) => ({
+          ...row,
+          url: withCdnUrl(row?.path),
+          altUrl: withCdnUrl(row?.path2)
+        }))
+      : rows;
+
+  return {
+    ...payload,
+    infoAnnualData: mapRows(payload?.infoAnnualData),
+    infoQuarterlyData: mapRows(payload?.infoQuarterlyData),
+    infoOtherData: mapRows(payload?.infoOtherData),
+    infoCompanyBannerAd: payload?.infoCompanyBannerAd
+      ? {
+          ...payload.infoCompanyBannerAd,
+          url: withCdnUrl(payload.infoCompanyBannerAd.path)
+        }
+      : payload?.infoCompanyBannerAd
+  };
 }
 
 async function getTradeSummary() {
@@ -292,30 +479,54 @@ server.tool(
 );
 
 server.tool(
+  "tradingView",
+  "Returns tradingView data for a symbol. Requires a valid CSE tradingView userName.",
+  {
+    symbol: z.string(),
+    userName: z.string().optional(),
+    password: z.string().optional()
+  },
+  async ({ symbol, userName, password }) => {
+    const resolvedUserName = userName || process.env.CSE_TRADINGVIEW_USERNAME;
+    if (!resolvedUserName) {
+      throw new Error(
+        "tradingView requires userName. Pass userName in tool input or set CSE_TRADINGVIEW_USERNAME."
+      );
+    }
+
+    const payload = {
+      symbol,
+      userName: resolvedUserName,
+      ...(password || process.env.CSE_TRADINGVIEW_PASSWORD
+        ? { password: password || process.env.CSE_TRADINGVIEW_PASSWORD }
+        : {})
+    };
+
+    return asText(await csePostJson("tradingView", payload));
+  }
+);
+
+server.tool(
+  "financials",
+  "Returns full financial disclosures for a symbol. Performs required company-profile preflight before /api/financials.",
+  {
+    symbol: z.string()
+  },
+  async ({ symbol }) => {
+    const payload = await csePostFinancials(symbol);
+    return asText(enrichFinancialsPayload(payload));
+  }
+);
+
+server.tool(
   "get_financial_reports",
   "Returns financial report metadata and CDN URLs for a symbol.",
   {
     symbol: z.string()
   },
   async ({ symbol }) => {
-    const payload = await csePost("financials", { symbol });
-    const withUrls = {
-      ...payload,
-      infoQuarterlyData: Array.isArray(payload?.infoQuarterlyData)
-        ? payload.infoQuarterlyData.map((row) => ({
-            ...row,
-            url: row?.path ? `https://cdn.cse.lk/${String(row.path).replace(/^\/+/, "")}` : null
-          }))
-        : payload?.infoQuarterlyData,
-      infoAnnualData: Array.isArray(payload?.infoAnnualData)
-        ? payload.infoAnnualData.map((row) => ({
-            ...row,
-            url: row?.path ? `https://cdn.cse.lk/${String(row.path).replace(/^\/+/, "")}` : null
-          }))
-        : payload?.infoAnnualData
-    };
-
-    return asText(withUrls);
+    const payload = await csePostFinancials(symbol);
+    return asText(enrichFinancialsPayload(payload));
   }
 );
 
